@@ -25,6 +25,7 @@ jobs:
         run: |
           git config user.name "kb-bot"
           git config user.email "bot@users.noreply.github.com"
+          git pull --rebase --autostash origin main || true
           git add -A
           git diff --staged --quiet || git commit -m "情报：医疗政策与指南 $(date -u +%F)"
           git push
