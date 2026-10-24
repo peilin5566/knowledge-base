@@ -126,7 +126,41 @@ npx quartz build --serve
 
 ---
 
-## 六、常见问题
+## 六、网络受限环境下的推送（代理环境必读）
+
+某些网络环境下，代理允许访问 `api.github.com` 但拦截 `github.com` 的 git 端点，
+导致 `git push` / `git fetch` 报 `CONNECT tunnel failed, response 502`。
+本仓库为此准备了两个 API 通道脚本（纯 Python 标准库，无需额外依赖）：
+
+```bash
+# 查看本地与远端差异
+bash scripts/push-api.sh --status
+
+# 从远端拉取（用 API tarball 覆盖工作区）
+bash scripts/push-api.sh --pull
+
+# 推送本地已提交的改动（用 REST API 逐文件提交）
+bash scripts/push-api.sh --push
+
+# 深度对齐：把远端 commit/tree/blob 对象写入本地 git 库，使本地 SHA 与远端完全一致
+python scripts/sync_git_objects.py
+```
+
+令牌来源优先级：环境变量 `GH_TOKEN` / `GITHUB_TOKEN` → Git Credential Manager 已登录的凭证。
+
+**验证是否受影响：**
+
+```bash
+curl -s -o /dev/null -w "api: %{http_code}\n" https://api.github.com/   # 200 即 API 通
+git ls-remote origin                                                  # 报 502 即 git 端点被拦
+```
+
+若 API 通而 git 端点不通，用上面的脚本替代 `git push` / `git pull` 即可，
+内容与历史都能保持一致。
+
+---
+
+## 七、常见问题
 
 **Actions 构建失败？**
 多半是 `package-lock.json` 未提交或 Node 版本问题；确认 `npm ci` 能本地跑通，再看 Actions 日志。
@@ -143,7 +177,7 @@ Settings → Pages → Custom domain 填入域名，并在 DNS 加一条 CNAME �
 
 ---
 
-## 七、数据所有权
+## 八、数据所有权
 
 所有内容都是本地 Markdown 纯文本，仓库即备份。建议再加一层异地备份：
 
