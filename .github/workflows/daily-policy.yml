@@ -1,0 +1,30 @@
+name: 每日医疗政策与指南
+
+on:
+  schedule:
+    - cron: "30 0 * * *"   # 北京时间 08:30
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 抓取政策与指南
+        env:
+          # 可选：多个 RSS 用逗号分隔，例如权威期刊 / 行业协会的更新源
+          POLICY_RSS: ""
+        run: python scripts/fetch_policy.py
+      - name: 提交入库
+        run: |
+          git config user.name "kb-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "情报：医疗政策与指南 $(date -u +%F)"
+          git push

@@ -1,0 +1,27 @@
+name: 每日 arXiv 论文日报
+
+on:
+  schedule:
+    - cron: "0 23 * * *"   # 北京时间 07:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 抓取论文
+        run: python scripts/fetch_arxiv.py
+      - name: 提交入库
+        run: |
+          git config user.name "kb-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "情报：arXiv 日报 $(date -u +%F)"
+          git push

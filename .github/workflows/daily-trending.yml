@@ -1,0 +1,30 @@
+name: 每日科技开源趋势
+
+on:
+  schedule:
+    - cron: "0 1 * * *"   # 北京时间 09:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 抓取 GitHub Trending
+        env:
+          # 可选：限定语言，例如 "python,typescript"；留空为全语言
+          LANGS: ""
+        run: python scripts/fetch_trending.py
+      - name: 提交入库
+        run: |
+          git config user.name "kb-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || git commit -m "情报：科技开源趋势 $(date -u +%F)"
+          git push
