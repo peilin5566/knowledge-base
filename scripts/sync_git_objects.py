@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
-GitHub API 通道的 git 对象同步器（并行 + 缓存版）
-用途：当 github.com 的 git smart-http 端点被代理拦截（CONNECT 502）时，
-      通过 REST API 把远端的 commit / tree / blob 对象写入本地 git 对象库，
-      使本地 HEAD 与远端 SHA 完全对齐，git log / git diff 正常工作。
-优化：blob 全局缓存（同一 blob 只下载一次）、树遍历并行下载。
+GitHub API 通道的 git 对象同步器 v3（精确 SHA 对齐）
+背景：github.com 的 git smart-http 被代理拦截（CONNECT 502），但 api.github.com 可用。
+      本脚本通过 REST API 重建远端的 commit/tree/blob 对象写入本地 git 库，
+      使本地 HEAD 与远端 SHA 逐字节一致。
+
+关键点：commit 对象里 author/committer 的时区偏移（如 +0800）无法从 API 直接读到
+      （API 统一归一化为 UTC），因此对候选时区做暴力枚举，反解出与远端一致的偏移量。
 用法：
-      python scripts/sync_git_objects.py          # 同步
-      python scripts/sync_git_objects.py --check  # 仅检查
+      python scripts/sync_git_objects.py          # 同步并对齐
+      python scripts/sync_git_objects.py --check  # 仅检查差异
 """
 import base64
+import datetime
+import hashlib
 import json
 import os
 import subprocess
 import sys
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = "peilin5566/knowledge-base"
 API = "https://api.github.com"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_WORKERS = 12
+
+# 候选时区偏移（15 分钟粒度，覆盖 -12:00 ~ +14:00）
+TZ_CANDIDATES = []
+for _h in range(-12, 15):
+    for _m in (0, 15, 30, 45):
+        _off = _h * 60 + _m
+        _sign = "+" if _off >= 0 else "-"
+        _a = abs(_off)
+        TZ_CANDIDATES.append(f"{_sign}{_a // 60:02d}{_a % 60:02d}")
+TZ_CANDIDATES = sorted(set(TZ_CANDIDATES))
 
 
 def get_token():
@@ -49,7 +63,6 @@ _cache = {}
 
 
 def api(path):
-    """带缓存的 API 调用"""
     if path in _cache:
         return _cache[path]
     req = urllib.request.Request(
@@ -60,16 +73,16 @@ def api(path):
             "User-Agent": "kb-sync",
         },
     )
-    for attempt in range(3):
+    last = None
+    for _ in range(4):
         try:
             with urllib.request.urlopen(req, timeout=90) as r:
                 data = json.loads(r.read().decode())
                 _cache[path] = data
                 return data
         except Exception as e:
-            if attempt == 2:
-                raise
-    return None
+            last = e
+    raise RuntimeError(f"API 失败 {path}: {last}")
 
 
 def git(*args, input_bytes=None, env=None):
@@ -83,7 +96,6 @@ def git(*args, input_bytes=None, env=None):
 
 
 _blob_done = set()
-_blob_lock_present = set()
 
 
 def write_blob(sha, content_bytes):
@@ -95,96 +107,86 @@ def write_blob(sha, content_bytes):
 
 
 def fetch_blobs_parallel(blobs):
-    """并行下载 blob 列表 [(sha, path)]"""
     todo = [(s, p) for s, p in blobs if s not in _blob_done]
     if not todo:
         return
-    print(f"  下载 {len(todo)} 个 blob（并行 {MAX_WORKERS}）...", flush=True)
-    done = 0
 
     def work(item):
-        sha, path = item
+        sha, _p = item
         blob = api(f"/repos/{REPO}/git/blobs/{sha}")
-        data = base64.b64decode(blob["content"])
-        write_blob(sha, data)
-        return sha
+        write_blob(sha, base64.b64decode(blob["content"]))
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(work, it): it for it in todo}
-        for fut in as_completed(futures):
-            try:
-                sha = fut.result()
-                _blob_done.add(sha)
-                done += 1
-                if done % 25 == 0:
-                    print(f"    {done}/{len(todo)}", flush=True)
-            except Exception as e:
-                print(f"    ! 失败 {futures[fut][1]}: {e}", flush=True)
-    print(f"  blob 完成 {done}/{len(todo)}", flush=True)
+        list(ex.map(work, todo))
+    _blob_done.update(s for s, _ in todo)
 
 
 def sync_tree(tree_sha):
-    """递归拉取 tree；并行下载 blob 后再组装"""
+    """递归重建 tree，返回 tree sha（与远端核对）"""
     t = api(f"/repos/{REPO}/git/trees/{tree_sha}")
-
-    blobs = []      # (sha, path, mode)
-    subtrees = []   # (sha, name, mode)
-    commitlinks = []
-
+    blobs, subtrees, commitlinks = [], [], []
     for e in t["tree"]:
         if e["type"] == "blob":
             blobs.append((e["sha"], e["path"], e["mode"]))
         elif e["type"] == "tree":
-            subtrees.append((e["sha"], e["path"], e["mode"]))
+            subtrees.append((e["sha"], e["path"]))
         elif e["type"] == "commit":
             commitlinks.append((e["mode"], "commit", e["sha"], e["path"]))
 
     fetch_blobs_parallel([(s, p) for s, p, _ in blobs])
 
-    entries = []
-    # 必须沿用远端原始 mode，否则 tree SHA 会与远端不一致
-    for sha, path, mode in blobs:
-        entries.append((mode, "blob", sha, path))
-    for sha, path, mode in subtrees:
-        sub = sync_tree(sha)
-        entries.append(("040000", "tree", sub, path))
-    for e in commitlinks:
-        entries.append(e)
+    entries = [(mode, "blob", sha, path) for sha, path, mode in blobs]
+    for sha, path in subtrees:
+        entries.append(("040000", "tree", sync_tree(sha), path))
+    entries.extend(commitlinks)
 
-    lines = []
-    for mode, otype, sha, name in sorted(entries, key=lambda x: x[3]):
-        lines.append(f"{mode} {otype} {sha}\t{name}")
-    payload = ("\n".join(lines) + "\n").encode()
-    p = git("mktree", input_bytes=payload)
+    lines = [f"{m} {t} {s}\t{n}" for m, t, s, n in sorted(entries, key=lambda x: x[3])]
+    p = git("mktree", input_bytes=("\n".join(lines) + "\n").encode())
     if p.returncode != 0:
         raise RuntimeError(f"mktree 失败: {p.stderr.decode()}")
-    return p.stdout.decode().strip()
-
-
-def build_commit(commit_sha):
-    c = api(f"/repos/{REPO}/git/commits/{commit_sha}")
-    tree_sha = sync_tree(c["tree"]["sha"])
-    parents = [build_commit(p["sha"]) for p in c.get("parents", [])]
-
-    au, co = c["author"], c["committer"]
-    env = {
-        "GIT_AUTHOR_NAME": au["name"],
-        "GIT_AUTHOR_EMAIL": au["email"],
-        "GIT_AUTHOR_DATE": au["date"],
-        "GIT_COMMITTER_NAME": co["name"],
-        "GIT_COMMITTER_EMAIL": co["email"],
-        "GIT_COMMITTER_DATE": co["date"],
-    }
-    args = ["commit-tree", tree_sha]
-    for p in parents:
-        args += ["-p", p]
-    p = git(*args, input_bytes=c["message"].encode(), env=env)
-    if p.returncode != 0:
-        raise RuntimeError(f"commit-tree 失败: {p.stderr.decode()}")
     got = p.stdout.decode().strip()
-    if got != commit_sha:
-        print(f"  ! commit SHA 不匹配 远端={commit_sha} 本地={got}", flush=True)
+    if got != tree_sha:
+        raise RuntimeError(f"tree SHA 不匹配：远端 {tree_sha} 本地 {got}")
     return got
+
+
+def parse_ts(date_str):
+    """'2026-10-24T05:13:17Z' -> epoch 秒"""
+    return int(datetime.datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
+               .replace(tzinfo=datetime.timezone.utc).timestamp())
+
+
+def build_commit_bytes(tree_sha, parent_shas, author, committer, message, tz_a, tz_c):
+    lines = [f"tree {tree_sha}"]
+    lines += [f"parent {p}" for p in parent_shas]
+    lines.append(
+        f"author {author['name']} <{author['email']}> {parse_ts(author['date'])} {tz_a}")
+    lines.append(
+        f"committer {committer['name']} <{committer['email']}> {parse_ts(committer['date'])} {tz_c}")
+    body = message if message.endswith("\n") else message + "\n"
+    return ("\n".join(lines) + "\n\n" + body).encode()
+
+
+def commit_sha_of(raw):
+    return hashlib.sha1(b"commit %d\0" % len(raw) + raw).hexdigest()
+
+
+def solve_commit(c, tree_sha, parent_shas):
+    """暴力枚举时区与换行组合，反解出与远端一致的 commit 对象"""
+    target = c["sha"]
+    msgs = [c["message"]]
+    if c["message"].endswith("\n"):
+        msgs.append(c["message"].rstrip("\n"))
+    msgs.append(c["message"] + "\n")
+
+    for tz_a in TZ_CANDIDATES:
+        for tz_c in TZ_CANDIDATES:
+            for msg in msgs:
+                raw = build_commit_bytes(
+                    tree_sha, parent_shas, c["author"], c["committer"], msg, tz_a, tz_c)
+                if commit_sha_of(raw) == target:
+                    return raw, tz_a, tz_c
+    return None, None, None
 
 
 def main():
@@ -201,32 +203,61 @@ def main():
         print("存在差异（--check 模式）")
         return 1
 
-    print("\n通过 API 重建远端 git 对象...\n", flush=True)
-    built = build_commit(remote_head)
+    print("\n收集远端提交链...", flush=True)
+    commits = {}
 
-    if built != remote_head:
-        print(f"\n重建 SHA 与远端不一致（远端 {remote_head} / 本地 {built}），已放弃切换引用。")
+    def collect(sha, depth=0):
+        if sha in commits or depth > 40:
+            return
+        c = api(f"/repos/{REPO}/git/commits/{sha}")
+        commits[sha] = c
+        for p in c.get("parents", []):
+            collect(p["sha"], depth + 1)
+
+    collect(remote_head)
+    print(f"  共 {len(commits)} 个提交")
+
+    built = {}
+    print("\n重建对象（tree → commit，暴力反解时区）...", flush=True)
+    for sha, c in commits.items():
+        parent_shas = [p["sha"] for p in c.get("parents", [])]
+        for ps in parent_shas:
+            if ps not in built:
+                sys.exit(f"父提交未就绪: {ps}")
+        tree_sha = sync_tree(c["tree"]["sha"])
+        raw, tz_a, tz_c = solve_commit(c, tree_sha, parent_shas)
+        if raw is None:
+            print(f"  ! 无法反解 {sha[:8]} 的时区/元数据")
+            return 2
+        p = git("hash-object", "-w", "-t", "commit", "--stdin", input_bytes=raw)
+        got = p.stdout.decode().strip()
+        if got != sha:
+            print(f"  ! 写入校验失败 {sha[:8]} != {got[:8]}")
+            return 2
+        built[sha] = got
+        print(f"  ✓ {sha[:8]} (author {tz_a} / committer {tz_c})", flush=True)
+
+    if built.get(remote_head) != remote_head:
+        print("远端 HEAD 未能正确重建，放弃切换引用。")
         return 2
 
-    # 保护工作区：先 stash 未提交改动，避免 reset --hard 丢失本地工作
     dirty = git("status", "--porcelain").stdout.decode().strip()
     if dirty:
         print("\n检测到未提交改动，先 stash 保护...")
         git("stash", "push", "-u", "-m", f"sync_git_objects 自动备份 {remote_head[:8]}")
 
-    git("update-ref", "refs/heads/main", built, local_head)
-    git("update-ref", "refs/remotes/origin/main", built)
-    git("reset", "--hard", built)
+    git("update-ref", "refs/heads/main", remote_head, local_head)
+    git("update-ref", "refs/remotes/origin/main", remote_head)
+    git("reset", "--hard", remote_head)
     git("clean", "-fd", "-e", "node_modules", "-e", "public", "-e", ".quartz")
 
-    # 恢复之前 stash 的本地改动
-    stash_out = git("stash", "list").stdout.decode()
-    if stash_out.strip():
+    if git("stash", "list").stdout.decode().strip():
         git("stash", "pop")
 
     print(f"\n同步后本地 HEAD: {git('rev-parse','HEAD').stdout.decode().strip()}")
     print("git log:")
     print(git("log", "--oneline", "-12").stdout.decode())
+    print(git("status", "-sb").stdout.decode())
     return 0
 
 
