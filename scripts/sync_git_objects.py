@@ -35,6 +35,8 @@ for _h in range(-12, 15):
         _a = abs(_off)
         TZ_CANDIDATES.append(f"{_sign}{_a // 60:02d}{_a % 60:02d}")
 TZ_CANDIDATES = sorted(set(TZ_CANDIDATES))
+# 高频时区优先命中，绝大多数提交用这几个即可，减少枚举开销
+TZ_COMMON = ["+0000", "+0800", "-0700", "-0500", "+0530", "+0900", "+0200", "+0100"]
 
 
 def get_token():
@@ -172,20 +174,44 @@ def commit_sha_of(raw):
 
 
 def solve_commit(c, tree_sha, parent_shas):
-    """暴力枚举时区与换行组合，反解出与远端一致的 commit 对象"""
+    """暴力枚举时区与换行组合，反解出与远端一致的 commit 对象
+    关键点：
+      1) author 与 committer 的时区偏移可能不同，需独立组合。
+      2) API 返回的 message 不含尾部换行，而 git 对象里的 commit 消息
+         通常带一个换行；两种都要尝试。"""
     target = c["sha"]
-    msgs = [c["message"]]
-    if c["message"].endswith("\n"):
-        msgs.append(c["message"].rstrip("\n"))
-    msgs.append(c["message"] + "\n")
+    raw_msg = c["message"]
+    msg_variants = [raw_msg]
+    if raw_msg.endswith("\n"):
+        msg_variants.append(raw_msg.rstrip("\n"))
+    msg_variants.append(raw_msg + "\n")
+    # 去重但保持顺序
+    seen, msg_bodies = set(), []
+    for m in msg_variants:
+        b = m.encode()
+        if b not in seen:
+            seen.add(b)
+            msg_bodies.append(b)
 
-    for tz_a in TZ_CANDIDATES:
-        for tz_c in TZ_CANDIDATES:
-            for msg in msgs:
-                raw = build_commit_bytes(
-                    tree_sha, parent_shas, c["author"], c["committer"], msg, tz_a, tz_c)
-                if commit_sha_of(raw) == target:
-                    return raw, tz_a, tz_c
+    header = f"tree {tree_sha}\n" + "".join(f"parent {p}\n" for p in parent_shas)
+    a_ts = parse_ts(c["author"]["date"])
+    c_ts = parse_ts(c["committer"]["date"])
+    a_ident = f"{c['author']['name']} <{c['author']['email']}>"
+    c_ident = f"{c['committer']['name']} <{c['committer']['email']}>"
+
+    # 先试高频时区（覆盖绝大多数提交），命中即返回；否则再全量枚举
+    for pool in (TZ_COMMON, TZ_CANDIDATES):
+        for tz_a in pool:
+            a_line = f"author {a_ident} {a_ts} {tz_a}\n".encode()
+            for tz_c in pool:
+                c_line = f"committer {c_ident} {c_ts} {tz_c}\n".encode()
+                mid = header.encode() + a_line + c_line + b"\n"
+                for body in msg_bodies:
+                    raw = mid + body
+                    if commit_sha_of(raw) == target:
+                        return raw, tz_a, tz_c
+        if pool is TZ_COMMON:
+            continue
     return None, None, None
 
 
@@ -219,7 +245,21 @@ def main():
 
     built = {}
     print("\n重建对象（tree → commit，暴力反解时区）...", flush=True)
-    for sha, c in commits.items():
+    # 必须按拓扑序（父提交在前）处理，否则父对象尚未就绪
+    def depth(sha, seen=None):
+        seen = seen or set()
+        if sha in seen:
+            return 0
+        seen.add(sha)
+        c = commits.get(sha)
+        if not c:
+            return 0
+        ps = c.get("parents", [])
+        return 1 + max([depth(p["sha"], seen) for p in ps], default=0)
+
+    ordered = sorted(commits.keys(), key=lambda s: (depth(s), s))
+    for sha in ordered:
+        c = commits[sha]
         parent_shas = [p["sha"] for p in c.get("parents", [])]
         for ps in parent_shas:
             if ps not in built:
